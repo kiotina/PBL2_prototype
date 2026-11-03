@@ -10,8 +10,8 @@ PBL2_prototype/
 ├─ src/
 │   ├─ config.py        경로와 모든 하이퍼파라미터
 │   ├─ preprocess.py    음성 → log-Mel, 정규화 통계, 저장
-│   ├─ train.py         DDPM(U-Net) 학습           (작성 예정)
-│   └─ evaluate.py      이상 점수, 임계값, EER·AUROC (작성 예정)
+│   ├─ train.py         DDPM(U-Net) 학습
+│   └─ evaluate.py      이상 점수, 임계값, EER·AUROC
 ├─ outputs/             실행 결과 (Git 제외)
 ├─ requirements.txt
 └─ README.md
@@ -28,11 +28,11 @@ python -m pip install -r requirements.txt
 ```
 
 ## 실행
-
-프로젝트 맨 위 폴더에서 실행합니다. 데이터 경로는 `src/config.py`의 `DATA_ROOT`에서 바꿉니다.
+venv 환경에서 실행
 
 ```powershell
 python src/preprocess.py
+python src/train.py
+python src/evaluate.py
 ```
 
-처음에는 `src/config.py`의 `FILE_LIMIT = 100`으로 작게 돌려 확인한 뒤, `None`으로 바꿔 전체를 실행합니다.
