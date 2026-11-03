@@ -1,0 +1,10 @@
+# PyTorch(GPU 버전)는 이 파일보다 먼저 따로 설치한다.
+#   python -m pip install torch --index-url https://download.pytorch.org/whl/cu128
+# 그다음 나머지를 설치한다.
+#   python -m pip install -r requirements.txt
+
+librosa        # 음성 파일 읽기, Mel-spectrogram 계산
+soundfile      # librosa가 FLAC/WAV 파일을 읽을 때 내부에서 사용
+numpy          # 숫자 배열 계산
+matplotlib     # 그림 저장 (Mel 예시, loss 곡선, 점수 분포)
+scikit-learn   # 평가 지표 계산 (EER, AUROC)
