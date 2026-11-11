@@ -27,28 +27,30 @@ from config import *  # config.py의 모든 설정값을 가져온다.
 # 1. 라벨(프로토콜) 읽기
 # ===============================
 
-def read_protocol(split):  # split: "train", "dev", "eval" 중 하나
+def read_protocol(data_name):  # data_name: config.py의 DATASETS 이름 (예: "2019_train", "2021_eval")
 
-    protocol_path = os.path.join(PROTOCOL_DIR, PROTOCOL_FILES[split])  # 읽을 프로토콜 파일 경로
-    audio_dir = os.path.join(DATA_ROOT, f"ASVspoof2019_LA_{split}", "flac")  # 음성 파일이 있는 폴더
+    dataset = DATASETS[data_name]  # 라벨 파일, 음성 폴더, 칸 번호
+    columns = dataset["columns"]  # 예: {"file_id": 1, "label": 4, ...}
+    min_parts = max(columns.values()) + 1  # 필요한 칸이 모두 있으려면 최소 이만큼 조각이 있어야 한다.
 
     items = []  # 파일 정보를 하나씩 담을 목록
 
-    with open(protocol_path, "r", encoding="utf-8") as f:  # 프로토콜 파일을 연다.
+    with open(dataset["protocol"], "r", encoding="utf-8") as f:  # 라벨 파일을 연다.
         for line in f:  # 한 줄씩 읽는다.
             parts = line.strip().split()  # 예: "LA_0079 LA_T_1138215 - - bonafide" → 5조각
-            if len(parts) != 5:  # 형식이 다른 줄(빈 줄 등)은 건너뛴다.
+            if len(parts) < min_parts:  # 칸이 모자란 줄(빈 줄 등)은 건너뛴다.
                 continue
 
-            speaker_id, file_id, _, attack_id, label = parts  # 세 번째 칸은 사용하지 않는다.
-
             items.append({  # 파일 하나의 정보를 저장한다.
-                "path": os.path.join(audio_dir, file_id + ".flac"),  # 음성 파일 경로
-                "speaker_id": speaker_id,  # 화자 ID
-                "file_id": file_id,  # 파일 ID
-                "attack_id": attack_id,  # 공격 종류 (real은 "-")
-                "label": label,  # "bonafide"(real) 또는 "spoof"(fake)
+                "path": os.path.join(dataset["audio_dir"], parts[columns["file_id"]] + ".flac"),  # 음성 파일 경로
+                "speaker_id": parts[columns["speaker_id"]],  # 화자 ID
+                "file_id": parts[columns["file_id"]],  # 파일 ID
+                "attack_id": parts[columns["attack_id"]],  # 공격 종류 (2019 real은 "-")
+                "label": parts[columns["label"]],  # "bonafide"(real) 또는 "spoof"(fake)
             })
+
+    if len(items) == 0:  # 한 줄도 못 읽었으면 칸 번호나 라벨 파일이 잘못된 것이다. (조용히 0개로 넘어가지 않도록)
+        raise ValueError(f"{data_name}: 라벨을 한 줄도 읽지 못했다. config.py의 protocol 경로와 columns를 확인할 것")
 
     return items  # 파일 정보 목록을 돌려준다.
 
@@ -193,9 +195,9 @@ def compute_stats(raw_logmels, masks):  # Mel 칸마다 평균과 표준편차�
 # 5. 분할별 처리
 # ===============================
 
-def select_bonafide(split):  # 해당 분할에서 real(bonafide) 파일만 고른다.
+def select_bonafide(data_name):  # 해당 데이터에서 real(bonafide) 파일만 고른다.
 
-    items = [item for item in read_protocol(split) if item["label"] == "bonafide"]  # real만
+    items = [item for item in read_protocol(data_name) if item["label"] == "bonafide"]  # real만
 
     if FILE_LIMIT is not None:  # 개발용으로 개수를 줄인 경우
         items = items[:FILE_LIMIT]  # 앞에서부터 FILE_LIMIT개만 사용한다.
@@ -205,7 +207,7 @@ def select_bonafide(split):  # 해당 분할에서 real(bonafide) 파일만 고�
 
 def build_train(stats_out_path, train_out_path):  # train real → 통계 + 파일별 전체 log-Mel
 
-    items = select_bonafide("train")  # train real 파일 목록
+    items = select_bonafide(TRAIN_DATA)  # train real 파일 목록
     print(f"[train] real 파일 {len(items)}개 처리 시작")
 
     raw_logmels, masks, file_ids = [], [], []  # 정규화 전 Mel, mask, 파일 ID
@@ -237,7 +239,7 @@ def build_train(stats_out_path, train_out_path):  # train real → 통계 + 파�
 
 def build_val(stats, val_out_path):  # dev real → 고정 2초 조각
 
-    items = select_bonafide("dev")  # dev real 파일 목록
+    items = select_bonafide(DEV_DATA)  # dev real 파일 목록
     print(f"[dev] real 파일 {len(items)}개 처리 시작")
 
     seg_mels, seg_masks, seg_file_ids = [], [], []  # 조각 Mel, 조각 mask, 조각의 원본 파일 ID
@@ -292,7 +294,7 @@ if __name__ == "__main__":  # python preprocess.py로 실행했을 때만 아래
     os.makedirs(PREPROCESS_DIR, exist_ok=True)  # 결과 폴더를 만든다.
 
     print("설정 확인")
-    print(f"  데이터 폴더: {DATA_ROOT}")
+    print(f"  학습 데이터: {TRAIN_DATA}, 검증 데이터: {DEV_DATA}")
     print(f"  2초 조각 = {SEGMENT_FRAMES}프레임, 1초 = {MIN_SEGMENT_FRAMES}프레임")
     print(f"  무음 mask: {MASK_SILENCE}, 파일 개수 제한: {FILE_LIMIT}")
 

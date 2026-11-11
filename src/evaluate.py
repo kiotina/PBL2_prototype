@@ -5,11 +5,17 @@
 # 순서
 #   1. 측정: dev real 전체와 eval 파일을 2초 창·1초 hop으로 자르고, 구간마다 t별 오차를 잰다.
 #   2. 보정: dev real 구간의 t별 평균·표준편차로 오차를 z-점수로 바꾼다. (real-only)
-#   3. 판정: 파일 점수(평균, 최댓값) → dev real 95백분위 임계값 → eval 지표
+#   3. 판정: 파일 점수(평균, 최댓값, Mahalanobis) → dev real 95백분위 임계값 → eval 지표
 #
-# 만드는 파일 (outputs/evaluation 폴더)
-#   segments.csv       : 구간마다 t별 오차 (파일 단위로 바로 기록 → 중간에 멈춰도 이어서 실행)
-#   calibration.json   : t별 평균·표준편차 (dev real로 계산)
+# 파일 점수 세 가지
+#   score_mean  : 구간 z-점수의 평균. "real보다 오차가 크면 fake"라고 가정한다.
+#   score_max   : 구간 z-점수의 최댓값. 가장 의심스러운 구간 하나로 판단한다.
+#   score_maha  : (t 3개 × 주파수 대역 8개) = 24개 오차가 dev real 분포에서 얼마나 떨어져 있는지 (Mahalanobis 거리).
+#                 오차가 크든 작든 "real과 다르면" 점수가 커진다. 방향을 가정하지 않는다.
+#
+# 만드는 파일 (outputs/<RUN_NAME>/evaluation_<EVAL_DATA> 폴더)
+#   segments.csv       : 구간마다 t별·대역별 오차 (파일 단위로 바로 기록 → 중간에 멈춰도 이어서 실행)
+#   calibration.json   : t별 평균·표준편차, Mahalanobis용 평균 (dev real로 계산)
 #   predictions.csv    : eval 파일마다 점수와 판정
 #   metrics.json       : EER, AUROC, 임계값에서 오탐률·탐지율, 공격별 지표
 #   score_hist.png     : real·fake 점수 분포와 임계값
@@ -28,10 +34,12 @@ from sklearn.metrics import roc_auc_score, roc_curve  # AUROC, ROC 곡선(EER �
 
 from config import *  # config.py의 모든 설정값을 가져온다.
 from preprocess import cut_segments, file_to_logmel, pad_to_segment, read_protocol  # 음성 → Mel → 조각 (전처리와 똑같이)
-from train import UNet, forward_diffusion, masked_mse  # 모델과 노이즈 섞기, 오차 계산 (학습과 똑같이)
+from train import UNet, forward_diffusion  # 모델과 노이즈 섞기 (학습과 똑같이)
 
-ERROR_COLUMNS = [f"e_t{t}" for t in SCORE_TIMESTEPS]  # 구간 오차 열 이름: e_t100, e_t300, e_t500
+TIME_COLUMNS = [f"e_t{t}" for t in SCORE_TIMESTEPS]  # t별 오차 이름: e_t100, e_t300, e_t500 (대역을 평균한 값. 보정용)
+ERROR_COLUMNS = [f"e_t{t}_b{b}" for t in SCORE_TIMESTEPS for b in range(NUM_BANDS)]  # e_t100_b0, …, e_t100_b7, e_t300_b0, …, e_t500_b7 (24개)
 SEGMENT_COLUMNS = ["split", "file_id", "label", "attack_id", "start_sec"] + ERROR_COLUMNS  # segments.csv의 열
+SCORE_KEYS = ["score_mean", "score_max", "score_maha"]  # 파일 점수 세 가지 (모두 "클수록 fake")
 
 
 # ===============================
@@ -71,8 +79,25 @@ def make_fixed_noises():  # seed마다 노이즈 하나를 만들어, 모든 파
 # 2. 파일 하나의 구간별 오차 측정
 # ===============================
 
+def band_mse(pred, target, mask):  # 구간마다, 주파수 대역마다 masked MSE (train.py의 masked_mse를 대역별로 나눈 것)
+
+    batch = pred.shape[0]  # 구간 수 B
+    bins_per_band = N_MELS // NUM_BANDS  # 대역 하나의 Mel 칸 수 = 10
+
+    mask = mask.expand_as(pred)  # (B, 1, 1, 126) → (B, 1, 80, 126): 같은 프레임의 80칸에 같은 mask
+    squared_error = (pred - target) ** 2 * mask  # mask=0인 칸(패딩, 무음)의 오차는 0으로 지운다.
+
+    squared_error = squared_error.reshape(batch, NUM_BANDS, bins_per_band, SEGMENT_FRAMES)  # (B, 8, 10, 126): 80칸을 10칸씩 8묶음으로
+    mask = mask.reshape(batch, NUM_BANDS, bins_per_band, SEGMENT_FRAMES)  # mask도 똑같이 나눈다.
+
+    error_sum = squared_error.sum(dim=(2, 3))  # (B, 8): 대역마다 오차의 합
+    count = mask.sum(dim=(2, 3))  # (B, 8): 대역마다 mask=1인 칸 수
+
+    return error_sum / count.clamp(min=LOSS_EPS)  # (B, 8): 대역마다 평균 오차. 8개를 평균하면 masked_mse와 같은 값이 된다.
+
+
 @torch.no_grad()  # 평가에서는 gradient를 계산하지 않는다.
-def measure_file(model, path, stats, fixed_noises):  # 파일 → 구간마다 t별 오차 (구간 수, t 수)
+def measure_file(model, path, stats, fixed_noises):  # 파일 → 구간마다 t별·대역별 오차 (구간 수, 3 × 8)
 
     logmel, mask = file_to_logmel(path, stats)  # 정규화된 log-Mel (80, 프레임 수), mask (프레임 수,)
     segments = cut_segments(logmel, mask, hop_frames=INFER_HOP_FRAMES)  # 2초 창을 1초씩 밀며 자른다.
@@ -80,6 +105,10 @@ def measure_file(model, path, stats, fixed_noises):  # 파일 → 구간마다 t
     if len(segments) == 0:  # 1초보다 짧은 파일은 조각이 안 나온다.
         piece_mel, piece_mask = pad_to_segment(logmel, mask)  # 파일 전체를 한 조각으로 채워서 쓴다. (eval 파일을 빼먹지 않도록)
         segments = [(piece_mel, piece_mask, 0)]
+
+    speech_segments = [s for s in segments if s[1].sum() > 0]  # mask가 전부 0인 구간(무음 mask를 켰을 때 생긴다)은 뺀다.
+    if len(speech_segments) > 0:  # 오차가 0으로 나와 "아주 real"처럼 보이므로 점수에 넣으면 안 된다.
+        segments = speech_segments  # 모든 구간이 무음인 드문 경우에는 원래 구간을 그대로 쓴다.
 
     mels = torch.from_numpy(np.stack([s[0] for s in segments]))[:, None].to(DEVICE)  # (S, 1, 80, 126)
     masks = torch.from_numpy(np.stack([s[1] for s in segments]))[:, None, None].to(DEVICE)  # (S, 1, 1, 126)
@@ -99,11 +128,12 @@ def measure_file(model, path, stats, fixed_noises):  # 파일 → 구간마다 t
             mask_list.append(masks)
 
     pred_noise = model(torch.cat(x_list), torch.cat(t_list))  # (6S, 1, 80, 126)
-    errors = masked_mse(pred_noise, torch.cat(noise_list), torch.cat(mask_list))  # (6S,): 구간마다 오차
-    errors = errors.view(len(SCORE_TIMESTEPS), len(fixed_noises), num_segments)  # (t 3, 노이즈 2, S): 위 반복 순서와 같다.
-    errors = errors.mean(dim=1)  # 노이즈 2개의 평균 → (3, S)
+    errors = band_mse(pred_noise, torch.cat(noise_list), torch.cat(mask_list))  # (6S, 8): 구간마다 대역별 오차
+    errors = errors.view(len(SCORE_TIMESTEPS), len(fixed_noises), num_segments, NUM_BANDS)  # (t 3, 노이즈 2, S, 8): 위 반복 순서와 같다.
+    errors = errors.mean(dim=1)  # 노이즈 2개의 평균 → (3, S, 8)
+    errors = errors.permute(1, 0, 2).reshape(num_segments, -1)  # (S, 3, 8) → (S, 24): ERROR_COLUMNS 순서(t 바깥, 대역 안쪽)와 같다.
 
-    return starts, errors.T.cpu().numpy()  # 시작 프레임 목록, (S, 3)
+    return starts, errors.cpu().numpy()  # 시작 프레임 목록, (S, 24)
 
 
 # ===============================
@@ -112,7 +142,7 @@ def measure_file(model, path, stats, fixed_noises):  # 파일 → 구간마다 t
 
 def select_eval_items():  # eval 파일 목록. EVAL_LIMIT가 있으면 무작위로 그 개수만 고른다.
 
-    items = read_protocol("eval")  # bona fide + spoof 전체
+    items = read_protocol(EVAL_DATA)  # bona fide + spoof 전체
 
     if EVAL_LIMIT is not None:  # 개발용으로 줄인 경우
         generator = torch.Generator().manual_seed(SEED)  # 언제 돌려도 같은 파일들이 뽑히도록 고정
@@ -133,6 +163,12 @@ def read_done_files(csv_path):  # segments.csv에 이미 기록된 (분할, 파�
 
 def measure_split(model, items, split, stats, fixed_noises, csv_path):  # 파일들을 측정해 segments.csv에 이어서 적는다.
 
+    if os.path.exists(csv_path):  # 이어서 실행하는 경우, 예전 형식(대역 없는 열)의 파일과 섞이지 않게 확인한다.
+        with open(csv_path, "r", encoding="utf-8") as f:
+            header = next(csv.reader(f))  # 첫 줄 = 열 이름
+        if header != SEGMENT_COLUMNS:
+            raise ValueError(f"{csv_path}의 열이 지금 코드와 다르다. 예전 평가 결과이므로 폴더 이름을 바꿔 두고 다시 실행할 것")
+
     done = read_done_files(csv_path)  # 이미 측정한 파일
     todo = [item for item in items if (split, item["file_id"]) not in done]  # 아직 측정하지 않은 파일만
     print(f"[{split}] 파일 {len(items)}개 중 이미 측정 {len(items) - len(todo)}개, 이번에 측정 {len(todo)}개")
@@ -148,7 +184,8 @@ def measure_split(model, items, split, stats, fixed_noises, csv_path):  # 파일
             starts, errors = measure_file(model, item["path"], stats, fixed_noises)  # (S, 3)
 
             if i == 0:  # 첫 파일에서 크기와 값을 확인한다.
-                print(f"  첫 파일 {item['file_id']}: 구간 {errors.shape[0]}개, 오차 크기 {errors.shape}, 첫 구간 오차 {np.round(errors[0], 4)}")
+                print(f"  첫 파일 {item['file_id']}: 구간 {errors.shape[0]}개, 오차 크기 {errors.shape} (구간 수, t 3 × 대역 {NUM_BANDS})")
+                print(f"  첫 구간 t별 오차(대역 평균): {np.round(errors[0].reshape(len(SCORE_TIMESTEPS), NUM_BANDS).mean(axis=1), 4)}")
 
             for start, error in zip(starts, errors):  # 구간마다 한 줄
                 start_sec = start * HOP_LENGTH / SAMPLE_RATE  # 시작 프레임 → 초
@@ -168,15 +205,20 @@ def load_segments(csv_path, split, file_ids):  # segments.csv에서 이번에 �
     with open(csv_path, "r", encoding="utf-8") as f:
         rows = [row for row in csv.DictReader(f) if row["split"] == split and row["file_id"] in file_ids]
 
-    errors = np.array([[float(row[c]) for c in ERROR_COLUMNS] for row in rows])  # (구간 수, 3)
+    errors = np.array([[float(row[c]) for c in ERROR_COLUMNS] for row in rows])  # (구간 수, 24)
 
     return rows, errors
 
 
-def calibrate(dev_errors):  # dev real 구간의 t별 평균·표준편차
+def time_errors(errors):  # (구간 수, 24) → (구간 수, 3): 대역 8개를 평균해 t별 오차로 되돌린다. (score_mean, score_max용)
+
+    return errors.reshape(len(errors), len(SCORE_TIMESTEPS), NUM_BANDS).mean(axis=2)
+
+
+def calibrate(dev_errors):  # dev real 구간의 t별 평균·표준편차 (dev_errors: (구간 수, 3))
 
     calibration = {}
-    for j, column in enumerate(ERROR_COLUMNS):  # t마다
+    for j, column in enumerate(TIME_COLUMNS):  # t마다
         calibration[column] = {
             "mean": float(dev_errors[:, j].mean()),  # μ_t
             "std": float(dev_errors[:, j].std()),  # σ_t
@@ -189,13 +231,52 @@ def calibrate(dev_errors):  # dev real 구간의 t별 평균·표준편차
 def segment_scores(errors, calibration):  # 구간 점수 = t별 z-점수의 평균
 
     z = np.zeros_like(errors)  # (구간 수, 3)
-    for j, column in enumerate(ERROR_COLUMNS):
+    for j, column in enumerate(TIME_COLUMNS):
         z[:, j] = (errors[:, j] - calibration[column]["mean"]) / calibration[column]["std"]  # z_t = (e_t − μ_t) / σ_t
 
     return z.mean(axis=1)  # (구간 수,): 클수록 "real답지 않다"
 
 
-def file_scores(rows, seg_scores):  # 구간 점수 → 파일 점수 (평균, 최댓값)
+def file_features(rows, errors):  # 파일마다 24개 오차를 구간 평균 → log. 반환: 파일ID → (24,)
+
+    groups = {}  # 파일ID → 구간 오차 목록
+    for row, error in zip(rows, errors):
+        groups.setdefault(row["file_id"], []).append(error)
+
+    features = {}
+    for file_id, file_errors in groups.items():
+        mean_error = np.mean(file_errors, axis=0)  # (24,): 파일 전체의 t별·대역별 평균 오차
+        features[file_id] = np.log(np.maximum(mean_error, LOSS_EPS))  # log를 씌우면 분포가 종 모양에 가까워진다. (0이면 log가 안 되므로 아주 작은 값으로)
+    # 오차는 0보다 큰 값이고 오른쪽으로 꼬리가 길다. Mahalanobis 거리는 종 모양(정규분포) 데이터에서 잘 동작하므로 log로 펴 준다.
+
+    return features
+
+
+def fit_real_distribution(dev_features):  # dev real 파일들의 24개 특징 → 평균과 공분산 (real-only)
+
+    X = np.stack(list(dev_features.values()))  # (dev real 파일 수, 24)
+    mean = X.mean(axis=0)  # (24,): real 파일의 "보통" 오차 모양
+    cov = np.cov(X, rowvar=False)  # (24, 24): 특징끼리 얼마나 함께 움직이는지 (예: 이웃 대역은 함께 커지고 작아진다)
+    print(f"Mahalanobis: dev real 파일 {X.shape[0]}개 × 특징 {X.shape[1]}개로 평균·공분산 계산")
+
+    return mean, cov
+
+
+def mahalanobis_scores(features, mean, cov):  # 파일마다 real 분포 중심에서의 거리. 반환: 파일ID → 거리
+
+    cov_inv = np.linalg.pinv(cov)  # 공분산의 역행렬 (pinv: 역행렬이 불안정해도 계산되는 방법)
+
+    scores = {}
+    for file_id, x in features.items():
+        diff = x - mean  # (24,): real 평균과의 차이 (+면 오차가 더 큼, −면 더 작음)
+        scores[file_id] = float(np.sqrt(diff @ cov_inv @ diff))  # 거리 = √(차이ᵀ · 공분산⁻¹ · 차이). 방향과 상관없이 멀수록 크다.
+    # 공분산⁻¹을 곱하는 이유: real에서도 원래 많이 흔들리는 특징의 차이는 작게, 거의 안 흔들리는 특징의 차이는 크게 본다.
+    # 특징이 하나뿐이면 |z-점수|와 같다.
+
+    return scores
+
+
+def file_scores(rows, seg_scores, maha_scores):  # 구간 점수 → 파일 점수 (평균, 최댓값) + Mahalanobis 점수를 붙인다.
 
     files = {}  # 파일ID → 정보와 구간 점수 목록
     for row, score in zip(rows, seg_scores):
@@ -212,6 +293,7 @@ def file_scores(rows, seg_scores):  # 구간 점수 → 파일 점수 (평균, �
             "num_segments": len(info["scores"]),
             "score_mean": float(np.mean(info["scores"])),  # 파일 전체가 얼마나 낯선지
             "score_max": float(np.max(info["scores"])),  # 가장 의심스러운 구간 (부분 변조 대응)
+            "score_maha": maha_scores[info["file_id"]],  # real 분포에서 얼마나 떨어져 있는지 (방향 무관)
         })
 
     return results
@@ -230,7 +312,7 @@ def compute_eer(labels, scores):  # EER: 오탐률(real→fake)과 미탐률(fak
     return float((fpr[idx] + fnr[idx]) / 2)
 
 
-def compute_metrics(results, key, threshold):  # key: "score_mean" 또는 "score_max"
+def compute_metrics(results, key, threshold):  # key: SCORE_KEYS 중 하나
 
     labels = np.array([1 if r["label"] == "spoof" else 0 for r in results])  # fake=1, real=0
     scores = np.array([r[key] for r in results])  # 클수록 fake로 본다.
@@ -262,21 +344,21 @@ def compute_metrics(results, key, threshold):  # key: "score_mean" 또는 "score
 
 def save_predictions(results, thresholds, out_path):  # eval 파일마다 점수와 판정
 
-    columns = ["file_id", "label", "attack_id", "num_segments", "score_mean", "score_max", "pred_mean", "pred_max"]
+    pred_columns = [key.replace("score_", "pred_") for key in SCORE_KEYS]  # pred_mean, pred_max, pred_maha
+    columns = ["file_id", "label", "attack_id", "num_segments"] + SCORE_KEYS + pred_columns
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(columns)
         for r in results:
-            pred_mean = "spoof" if r["score_mean"] > thresholds["score_mean"] else "bonafide"  # 임계값보다 크면 fake
-            pred_max = "spoof" if r["score_max"] > thresholds["score_max"] else "bonafide"
-            writer.writerow([r["file_id"], r["label"], r["attack_id"], r["num_segments"],
-                             f"{r['score_mean']:.6f}", f"{r['score_max']:.6f}", pred_mean, pred_max])
+            scores = [f"{r[key]:.6f}" for key in SCORE_KEYS]
+            preds = ["spoof" if r[key] > thresholds[key] else "bonafide" for key in SCORE_KEYS]  # 임계값보다 크면 fake
+            writer.writerow([r["file_id"], r["label"], r["attack_id"], r["num_segments"]] + scores + preds)
 
 
 def save_score_hist(results, thresholds, out_path):  # real·fake 점수 분포와 임계값
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    for ax, key in zip(axes, ["score_mean", "score_max"]):
+    fig, axes = plt.subplots(1, len(SCORE_KEYS), figsize=(6 * len(SCORE_KEYS), 4))
+    for ax, key in zip(axes, SCORE_KEYS):
         real = [r[key] for r in results if r["label"] == "bonafide"]
         fake = [r[key] for r in results if r["label"] == "spoof"]
         ax.hist(real, bins=100, density=True, alpha=0.6, label=f"bona fide ({len(real)})")  # 개수가 크게 달라서 밀도로 그린다.
@@ -293,16 +375,17 @@ def save_score_hist(results, thresholds, out_path):  # real·fake 점수 분포�
 def print_table(metrics):  # 결과 표를 출력한다.
 
     print(f"{'':10s} | {'EER':>7s} | {'AUROC':>7s}")
-    for key in ["score_mean", "score_max"]:
+    for key in SCORE_KEYS:
         m = metrics[key]
         print(f"{key:10s} | {m['eer'] * 100:6.2f}% | {m['auroc']:.4f} | 오탐률 {m['false_alarm_rate'] * 100:.1f}%, 탐지율 {m['detection_rate'] * 100:.1f}%")
 
-    print("공격별 (score_mean / score_max)")
+    print("공격별 EER (score_mean / score_max / score_maha)")
     for attack in metrics["score_mean"]["per_attack"]:
-        a_mean = metrics["score_mean"]["per_attack"][attack]
-        a_max = metrics["score_max"]["per_attack"][attack]
-        warn = "  ← AUROC < 0.5 (fake의 오차가 더 작음)" if min(a_mean["auroc"], a_max["auroc"]) < 0.5 else ""
-        print(f"  {attack} ({a_mean['num_spoof']:5d}개) | EER {a_mean['eer'] * 100:6.2f}% / {a_max['eer'] * 100:6.2f}% | AUROC {a_mean['auroc']:.4f} / {a_max['auroc']:.4f}{warn}")
+        per = [metrics[key]["per_attack"][attack] for key in SCORE_KEYS]  # 점수 세 가지의 이 공격 결과
+        eers = " / ".join(f"{p['eer'] * 100:6.2f}%" for p in per)
+        aurocs = " / ".join(f"{p['auroc']:.4f}" for p in per)
+        warn = "  ← score_mean AUROC < 0.5 (fake의 오차가 더 작음)" if per[0]["auroc"] < 0.5 else ""
+        print(f"  {attack} ({per[0]['num_spoof']:5d}개) | EER {eers} | AUROC {aurocs}{warn}")
 
 
 # ===============================
@@ -321,7 +404,7 @@ if __name__ == "__main__":  # python evaluate.py로 실행했을 때만 아래�
     fixed_noises = make_fixed_noises()
 
     # ----- 1. 측정 -----
-    dev_items = [item for item in read_protocol("dev") if item["label"] == "bonafide"]  # dev는 real만 (real-only)
+    dev_items = [item for item in read_protocol(DEV_DATA) if item["label"] == "bonafide"]  # dev는 real만 (real-only)
     eval_items = select_eval_items()
     measure_split(model, dev_items, "dev", stats, fixed_noises, segments_path)
     measure_split(model, eval_items, "eval", stats, fixed_noises, segments_path)
@@ -331,18 +414,24 @@ if __name__ == "__main__":  # python evaluate.py로 실행했을 때만 아래�
     eval_rows, eval_errors = load_segments(segments_path, "eval", {item["file_id"] for item in eval_items})
     print(f"구간 수: dev real {len(dev_rows)}개, eval {len(eval_rows)}개")
 
-    calibration = calibrate(dev_errors)
-    with open(os.path.join(EVAL_DIR, "calibration.json"), "w", encoding="utf-8") as f:
-        json.dump(calibration, f, indent=2)
+    calibration = calibrate(time_errors(dev_errors))  # score_mean, score_max용: t별 평균·표준편차
     for column, value in calibration.items():
         print(f"  {column}: 평균 {value['mean']:.4f}, 표준편차 {value['std']:.4f}")
 
+    dev_features = file_features(dev_rows, dev_errors)  # score_maha용: 파일마다 24개 특징
+    eval_features = file_features(eval_rows, eval_errors)
+    maha_mean, maha_cov = fit_real_distribution(dev_features)  # dev real만으로 "real의 모양"을 정한다.
+    calibration["mahalanobis"] = {"mean": maha_mean.tolist(), "cov": maha_cov.tolist()}  # 나중에 다시 계산할 수 있게 저장
+
+    with open(os.path.join(EVAL_DIR, "calibration.json"), "w", encoding="utf-8") as f:
+        json.dump(calibration, f, indent=2)
+
     # ----- 3. 파일 점수와 임계값 (dev real만) -----
-    dev_results = file_scores(dev_rows, segment_scores(dev_errors, calibration))
-    eval_results = file_scores(eval_rows, segment_scores(eval_errors, calibration))
+    dev_results = file_scores(dev_rows, segment_scores(time_errors(dev_errors), calibration), mahalanobis_scores(dev_features, maha_mean, maha_cov))
+    eval_results = file_scores(eval_rows, segment_scores(time_errors(eval_errors), calibration), mahalanobis_scores(eval_features, maha_mean, maha_cov))
 
     thresholds = {}
-    for key in ["score_mean", "score_max"]:
+    for key in SCORE_KEYS:
         thresholds[key] = float(np.percentile([r[key] for r in dev_results], THRESHOLD_PERCENTILE))  # dev real 95백분위
         print(f"임계값 {key}: {thresholds[key]:.4f}")
 
@@ -354,9 +443,9 @@ if __name__ == "__main__":  # python evaluate.py로 실행했을 때만 아래�
             "dev_bonafide": len(dev_results),
         },
         "eval_limit": EVAL_LIMIT,
-        "score_mean": compute_metrics(eval_results, "score_mean", thresholds["score_mean"]),
-        "score_max": compute_metrics(eval_results, "score_max", thresholds["score_max"]),
     }
+    for key in SCORE_KEYS:  # 점수 세 가지 각각의 지표
+        metrics[key] = compute_metrics(eval_results, key, thresholds[key])
 
     with open(os.path.join(EVAL_DIR, "metrics.json"), "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)

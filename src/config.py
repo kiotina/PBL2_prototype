@@ -14,21 +14,51 @@ import torch  # GPU 사용 가능 여부를 확인하고 난수 시작값을 고
 # 1. 경로
 # ===============================
 
-DATA_ROOT = r"H:\Workspace\Dataset\LA"  # ASVspoof 2019 LA 데이터셋 폴더
+DATASET_ROOT = r"H:\Workspace\Dataset"  # 모든 데이터셋이 들어 있는 폴더
+LA2019_ROOT = os.path.join(DATASET_ROOT, "LA")  # ASVspoof 2019 LA (train, dev, eval)
+LA2021_ROOT = os.path.join(DATASET_ROOT, "ASVspoof2021_LA_eval")  # ASVspoof 2021 LA (eval만 있다)
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # src 폴더의 한 칸 위 = 프로젝트 폴더
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "outputs")  # 어디서 실행하든 항상 프로젝트 폴더의 outputs에 저장한다.
 
-PROTOCOL_DIR = os.path.join(DATA_ROOT, "ASVspoof2019_LA_cm_protocols")  # 라벨(프로토콜) txt 파일이 있는 폴더
+# 라벨 파일 한 줄에서 몇 번째 칸(0부터 센다)에 무엇이 있는지
+COLUMNS_2019 = {"speaker_id": 0, "file_id": 1, "attack_id": 3, "label": 4}  # 예: "LA_0079 LA_T_1138215 - - bonafide"
+COLUMNS_2021 = {"speaker_id": 0, "file_id": 1, "attack_id": 4, "label": 5}  # 예: "LA_0009 LA_E_9332881 alaw ita_tx A07 spoof notrim eval"
 
-PROTOCOL_FILES = {  # 분할 이름 → 프로토콜 파일 이름
-    "train": "ASVspoof2019.LA.cm.train.trn.txt",  # 학습용 라벨
-    "dev": "ASVspoof2019.LA.cm.dev.trl.txt",  # 검증용 라벨
-    "eval": "ASVspoof2019.LA.cm.eval.trl.txt",  # 평가용 라벨
+DATASETS = {  # 데이터 이름 → 라벨 파일, 음성 폴더, 칸 번호. 새 데이터셋은 여기에 한 항목을 추가한다.
+    "2019_train": {
+        "protocol": os.path.join(LA2019_ROOT, "ASVspoof2019_LA_cm_protocols", "ASVspoof2019.LA.cm.train.trn.txt"),
+        "audio_dir": os.path.join(LA2019_ROOT, "ASVspoof2019_LA_train", "flac"),
+        "columns": COLUMNS_2019,
+    },
+    "2019_dev": {
+        "protocol": os.path.join(LA2019_ROOT, "ASVspoof2019_LA_cm_protocols", "ASVspoof2019.LA.cm.dev.trl.txt"),
+        "audio_dir": os.path.join(LA2019_ROOT, "ASVspoof2019_LA_dev", "flac"),
+        "columns": COLUMNS_2019,
+    },
+    "2019_eval": {
+        "protocol": os.path.join(LA2019_ROOT, "ASVspoof2019_LA_cm_protocols", "ASVspoof2019.LA.cm.eval.trl.txt"),
+        "audio_dir": os.path.join(LA2019_ROOT, "ASVspoof2019_LA_eval", "flac"),
+        "columns": COLUMNS_2019,
+    },
+    "2021_eval": {
+        # 폴더 안의 ASVspoof2021.LA.cm.eval.trl.txt에는 파일ID만 있고 정답(real/fake)이 없다.
+        # 정답은 따로 공개된 키 파일(LA-keys-full.tar.gz)에 있다. LA2021_ROOT 안에 풀어 둔 keys 폴더를 쓴다.
+        "protocol": os.path.join(LA2021_ROOT, "keys", "LA", "CM", "trial_metadata.txt"),
+        "audio_dir": os.path.join(LA2021_ROOT, "flac"),
+        "columns": COLUMNS_2021,
+    },
 }
 
-PREPROCESS_DIR = os.path.join(OUTPUT_DIR, "preprocess")  # 전처리 결과를 저장할 폴더
-CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoints")  # 학습한 모델을 저장할 폴더
-EVAL_DIR = os.path.join(OUTPUT_DIR, "evaluation")  # 평가 결과를 저장할 폴더
+TRAIN_DATA = "2019_train"  # 학습에 쓸 데이터 (bona fide만 사용)
+DEV_DATA = "2019_dev"  # 검증·보정·임계값에 쓸 데이터 (bona fide만 사용)
+EVAL_DATA = "2019_eval"  # 최종 평가에 쓸 데이터. 평가 데이터를 바꿀 때는 이 이름만 바꾼다.
+
+RUN_NAME = "mask_silence"  # 실험 이름. 결과가 outputs/<RUN_NAME>/에 따로 저장된다. 설정을 바꿔 새로 실험할 때는 이름도 바꾼다. (첫 실험: "baseline")
+RUN_DIR = os.path.join(OUTPUT_DIR, RUN_NAME)  # 이번 실험의 결과 폴더
+
+PREPROCESS_DIR = os.path.join(RUN_DIR, "preprocess")  # 전처리 결과를 저장할 폴더
+CHECKPOINT_DIR = os.path.join(RUN_DIR, "checkpoints")  # 학습한 모델을 저장할 폴더
+EVAL_DIR = os.path.join(RUN_DIR, f"evaluation_{EVAL_DATA}")  # 평가 결과를 저장할 폴더 (평가 데이터마다 따로 저장)
 
 
 # ===============================
@@ -58,7 +88,7 @@ MIN_SEGMENT_FRAMES = 1 + int(MIN_SEGMENT_SEC * SAMPLE_RATE) // HOP_LENGTH  # 1�
 # 4. 무음 mask 설정 (기능만 만들어 두고 기본값은 끈다)
 # ===============================
 
-MASK_SILENCE = False  # True면 무음 프레임도 mask=0으로 만들어 loss와 점수에서 뺀다.
+MASK_SILENCE = True  # True면 무음 프레임도 mask=0으로 만들어 loss와 점수에서 뺀다.
 SILENCE_DB_THRESHOLD = -40.0  # 파일에서 가장 큰 프레임보다 이만큼(dB) 작으면 무음으로 본다.
 
 
@@ -107,6 +137,8 @@ SCORE_TIMESTEPS = [100, 300, 500]  # 이상 점수에 사용할 t
 SCORE_NOISE_SEEDS = [1729, 2718]  # t마다 사용할 고정 노이즈의 시작값
 INFER_HOP_SEC = 1.0  # 평가할 때 2초 창을 1초씩 밀면서 자른다.
 INFER_HOP_FRAMES = int(INFER_HOP_SEC * SAMPLE_RATE) // HOP_LENGTH  # 1초 = 62프레임
+
+NUM_BANDS = 8  # 80개 Mel 칸을 8개 주파수 대역(대역마다 10칸)으로 나눠 오차를 따로 잰다. (N_MELS를 나눠떨어지게 할 것)
 
 THRESHOLD_PERCENTILE = 95  # dev bona fide 점수의 95백분위를 임계값으로 쓴다.
 
